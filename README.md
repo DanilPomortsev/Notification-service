@@ -12,11 +12,42 @@
 - внешние провайдеры с лимитами и периодической недоступностью;
 - запрет на «случайные» дубли при повторных запросах клиента и при at-least-once доставке внутри платформы.
 
-Решение разделено на **Control Plane** (шаблоны, политики провайдеров) и **Data Plane** (балансировщик → сервис валидации → основной сервис уведомлений → воркеры провайдеров, outbox, история).
+Решение разделено на **Control Plane** (шаблоны, **Provider Config Service** — конфигурации провайдеров в отдельной БД) и **Data Plane** (балансировщик → сервис валидации → основной сервис уведомлений → воркеры провайдеров, outbox, история).
 
 ---
 
-## 2. Глоссарий
+## 2. Основные пользовательские и технические сценарии
+
+### 2.1. Пользовательские
+
+Сценарии со стороны внутренних сервисов и конечного получателя.
+
+| Сценарий | Описание |
+|----------|----------|
+| **Отправка уведомления** | Сервис заказов вызывает `POST /v1/notifications` (email / push / SMS), передаёт получателя, тип и параметры шаблона — получает `notification_id` и статус `created` |
+| **Повтор запроса** | Клиент ретраит HTTP с тем же `Idempotency-Key` — получает тот же ответ, второе уведомление не создаётся |
+| **Статус доставки** | По `GET /v1/notifications/{id}` видно текущий статус: `created`, `processing`, `sent` или `failed` |
+| **История по получателю** | `GET /v1/notifications?recipient_id=…&from=…&to=…` — список уведомлений и timeline событий за период |
+| **Разные каналы** | Один и тот же бизнес-событие может уйти разными каналами (например, SMS с кодом и email с деталями заказа) — независимо друг от друга |
+
+### 2.2. Технические
+
+Сценарии работы платформы «под капотом».
+
+| Сценарий | Описание |
+|----------|----------|
+| **Приём и постановка в очередь** | Validation → Notification Service: одна транзакция `notifications` + `outbox` + запись в `notification_history`; ответ **202** без вызова провайдера |
+| **Асинхронная доставка** | Provider Worker забирает задачу из outbox (`SELECT … FOR UPDATE SKIP LOCKED`), рендерит шаблон, вызывает провайдера |
+| **Успешная отправка** | Провайдер вернул OK → `status = sent`, outbox `done`, снимок в history |
+| **Retry при сбое провайдера** | Временная ошибка (503, timeout) → новая строка outbox `retry` с `scheduled_at`; до `max_attempts` |
+| **Финальный отказ** | Fatal-ошибка или исчерпан лимит попыток → `status = failed`, outbox `dead` |
+| **Защита от дублей** | Идемпотентность на приёме (Redis) + уникальный индекс в PostgreSQL |
+| **Ограничение нагрузки на провайдера** | Rate limiter и circuit breaker на воркере; конфигурация из Provider Config Service |
+| **Обновление конфигурации** | Администратор меняет лимиты или endpoint в Provider Config Service — воркеры подхватывают через кэш без рестарта |
+
+---
+
+## 3. Глоссарий
 
 | Термин | Определение                                                                                         |
 |--------|-----------------------------------------------------------------------------------------------------|
@@ -31,10 +62,11 @@
 | Deduplication | Гарантия, что одно логическое уведомление не уйдёт пользователю дважды.                             |
 | Outbox | Таблица задач на отправку/повтор; запись в одной транзакции с уведомлением; обрабатывается воркерами. |
 | Validation Service | Сервис проверки запроса и идемпотентности (собственный Redis).                                      |
+| Provider Config Service | Control Plane: хранение и выдача конфигурации провайдера по каналу (лимиты, endpoint, retry-политика). |
 
 ---
 
-## 3. Функциональные требования
+## 4. Функциональные требования
 
 Система обеспечивает:
 
@@ -49,7 +81,7 @@
 
 ---
 
-## 4. Нефункциональные требования
+## 5. Нефункциональные требования
 
 | Область | Требование | Следствие для архитектуры |
 |---------|------------|---------------------------|
@@ -62,11 +94,11 @@
 
 ---
 
-## 5. Архитектура решения (общая схема)
+## 6. Архитектура решения (общая схема)
 
 Платформа построена вокруг **outbox в PostgreSQL**: приём фиксирует уведомление и задачу на доставку в одной транзакции; воркеры провайдеров забирают задачи через `SELECT … FOR UPDATE SKIP LOCKED`. **Kafka не используется** — очередь доставки и retry — строки в партиционированной таблице `outbox_events`.
 
-### 5.1. Семь шагов потока (видение решения)
+### 6.1. Семь шагов потока (видение решения)
 
 ```mermaid
 flowchart LR
@@ -74,156 +106,59 @@ flowchart LR
     LB --> VAL[Validation Service]
     VAL --> REDIS[(Redis Validation)]
     VAL --> NS[Notification Service]
-    NS --> PG[(PostgreSQL)]
+    NS --> PG[(PostgreSQL Data)]
     NS --> W_EMAIL[Email Worker]
     NS --> W_PUSH[Push Worker]
     NS --> W_SMS[SMS Worker]
+    W_EMAIL & W_PUSH & W_SMS --> PCS[Provider Config Service]
+    PCS --> PG_CFG[(PostgreSQL Config)]
     W_EMAIL --> P1[SMTP]
     W_PUSH --> P2[FCM/APNs]
     W_SMS --> P3[SMS API]
     W_EMAIL & W_PUSH & W_SMS --> PG
 ```
 
-| Шаг | Компонент | Действие |
-|-----|-----------|----------|
-| **1** | Load Balancer | Принимает `POST /v1/notifications`, распределяет по инстансам Validation Service |
-| **2** | Validation Service | Проверяет JSON, шаблон, параметры; **идемпотентность в своём Redis** |
-| **3** | Notification Service | В одной транзакции: `notifications` (`created`) + `outbox_events` (`send`) + запись в `notification_history` |
-| **4** | Provider Worker | `SELECT FOR UPDATE SKIP LOCKED` по своему каналу → `processing` → рендер → вызов провайдера; при ошибке — **outbox `retry`**, при успехе — **`sent`** |
-| **5** | Provider Worker | Работает с **rate limiter** и **circuit breaker** конкретного провайдера |
-| **6** | Любое изменение статуса | **Append** строки в `notification_history` |
-| **7** | Outbox | Таблица **партиционирована** по времени (см. §8) |
-
-> В п.4 вашего видения финальный успешный статус — **`sent`** (не `created`).
-
 ---
 
-## 6. Компоненты
+## 7. Компоненты
 
-### 6.1. Load Balancer
+### 7.1. Load Balancer
 
-- HAProxy / cloud LB, TLS на периметре.
-- Health check Validation Service.
-- Sticky sessions **не нужны** — сервисы stateless (воркеры конкурируют за outbox через `SKIP LOCKED`).
+- Обычный балансировщик нагрузки
 
-### 6.2. Validation Service
+### 7.2. Validation Service
 
-**Зона ответственности:** всё, что должно уложиться в P95 ≤ 100 ms **до** записи в основную БД.
+Первый контур приёма — всё, что должно уложиться в **P95 ≤ 100 ms** до записи в основную БД.
 
-| Этап | Деталь |
-|------|--------|
-| Синтаксис | JSON, обязательные поля, `channel ∈ {email, push, sms}` |
-| Шаблон | Есть активный шаблон `(notification_type, channel)`; `required_params` ⊆ `payload` |
-| Идемпотентность | **Собственный Redis Cluster** (отдельный от rate limit воркеров) |
+| Задача | Что делает |
+|--------|------------|
+| **Валидация** | Проверяет формат запроса, канал, шаблон и параметры |
+| **Дедупликация** | Ищет `Idempotency-Key` в Redis — при повторе отдаёт прежний ответ |
+| **Фиксация** | После успеха в Notification Service сохраняет ключ и результат |
 
-**Идемпотентность (Redis Validation):**
+> Не пишет в `notifications` и outbox.
 
-```
-KEY: idemp:{client_id}:{idempotency_key}
-VALUE: { "notification_id": "...", "status": "...", "created_at": "..." }
-TTL: 86400 (24 ч)
-```
+### 7.3. Notification Service (основной)
 
-Алгоритм:
+Ядро Data Plane: **сохраняет** уведомление и ставит задачу на доставку. Провайдер на этом этапе **не вызывается** — только запись в БД и outbox.
 
-1. `GET idemp:...` — если есть → **200** с сохранённым телом (без вызова Notification Service).
-2. Если нет → HTTP во **внутренний** Notification Service.
-3. После успешного ответа Notification Service → `SET idemp:...` с результатом.
+| Задача | Что делает |
+|--------|------------|
+| **Создание** | В одной транзакции: `notifications` (`created`) + `outbox_events` (`send`, `pending`) + первая запись в `notification_history` |
+| **API уведомлений** | `POST /internal/v1/notifications` — приём от Validation Service; `GET /v1/notifications/{id}` — статус уведомления |
+| **API истории** | `GET /v1/notifications?recipient_id=…&from=…&to=…` — история и timeline по получателю (read-replica) |
 
-Дублирующий уникальный индекс `(client_id, idempotency_key)` в PostgreSQL остаётся **страховкой**, если Redis протух или недоступен.
+> Ответ клиенту после создания: **202** с `notification_id`, `status`, `created_at`. Доставку выполняют **Provider Workers** (§7.4).
 
-Validation Service **не пишет** в `notifications` и **не трогает** outbox.
+### 7.4. Provider Workers
 
-### 6.3. Notification Service (основной)
+Асинхронная доставка: отдельный сервис **на канал** (email / push / sms). Каждый воркер обслуживает только своего провайдера.
 
-**Зона ответственности:** создание уведомления и постановка задачи на доставку.
-
-Внутренний endpoint (только из Validation Service):
-
-```http
-POST /internal/v1/notifications
-```
-
-**Одна транзакция PostgreSQL:**
-
-```sql
-BEGIN;
-
-INSERT INTO notifications (
-  notification_id, client_id, idempotency_key,
-  channel, notification_type, template_version,
-  recipient_id, recipient_address, payload,
-  status, created_at, attempt_count
-) VALUES (..., 'created', now(), 0);
-
-INSERT INTO outbox_events (
-  outbox_id, notification_id, channel,
-  event_type, status, attempt_no, created_at
-) VALUES (..., ..., 'email', 'send', 'pending', 1, now());
-
-INSERT INTO notification_history (
-  history_id, notification_id, status, channel,
-  event_type, payload_snapshot, created_at
-) VALUES (..., ..., 'created', 'email', 'notification_created', ...);
-
-COMMIT;
-```
-
-Ответ Validation Service → клиенту:
-
-```json
-HTTP 202
-{
-  "notification_id": "550e8400-...",
-  "status": "created",
-  "created_at": "2026-05-18T14:22:01Z"
-}
-```
-
-Провайдер **не вызывается**. Задача на отправку — строка outbox `event_type = send`, `status = pending`.
-
-В том же процессе (или отдельных deployment) крутятся **Provider Workers** — см. §6.4.
-
-### 6.4. Provider Workers (в составе Notification Service)
-
-Отдельный пул горутин/процессов **на канал** (email / push / sms). Каждый воркер знает только своего провайдера.
-
-**Цикл воркера (email):**
-
-```sql
-BEGIN;
-
-SELECT o.outbox_id, o.notification_id, o.attempt_no, o.event_type,
-       n.template_version, n.payload, n.recipient_address, n.status
-FROM outbox_events o
-JOIN notifications n ON n.notification_id = o.notification_id
-WHERE o.channel = 'email'
-  AND o.status = 'pending'
-  AND (o.scheduled_at IS NULL OR o.scheduled_at <= now())
-ORDER BY o.created_at
-LIMIT 1
-FOR UPDATE OF o SKIP LOCKED;
-
-UPDATE outbox_events SET status = 'processing' WHERE outbox_id = :id;
-
-UPDATE notifications
-SET status = 'processing', processing_at = now()
-WHERE notification_id = :nid AND status IN ('created', 'processing');
-
-INSERT INTO notification_history (...)  -- статус processing
-
-COMMIT;
-```
-
-Далее **вне** длинной транзакции (чтобы не держать lock на outbox на время SMTP):
-
-1. Рендер шаблона (`template_version` + `payload`).
-2. **Rate limiter** провайдера (§10).
-3. **Circuit breaker** (§10).
-4. Вызов SMTP.
-5. Транзакция результата (§9).
-
-Масштабирование: N инстансов Notification Service, каждый с email-воркерами; `SKIP LOCKED` распределяет строки outbox без дублей.
+| Задача | Что делает |
+|--------|------------|
+| **Захват задачи** | `SELECT … FOR UPDATE SKIP LOCKED` по outbox с фильтром своего канала (`pending`, `scheduled_at` готов) — без конкуренции между воркерами |
+| **Доставка** | Рендер шаблона → конфиг из Provider Config Service → rate limit и circuit breaker → вызов провайдера |
+| **Результат** | Обновляет `notifications`, outbox и `notification_history`: `sent`, retry или `failed` |
 
 ---
 
@@ -233,14 +168,17 @@ COMMIT;
 
 | Поле | Описание |
 |------|----------|
-| `notification_id` | UUID, PK |
-| `client_id`, `idempotency_key` | UNIQUE(client_id, idempotency_key) |
-| `channel` | email \| push \| sms |
-| `notification_type`, `template_version`, `payload` | |
-| `status` | created → processing → sent \| failed |
-| `attempt_count` | число попыток вызова провайдера |
-| `provider_message_id`, `last_error` | |
-| `created_at`, `processing_at`, `sent_at`, `failed_at` | |
+| `notification_id` | Уникальный идентификатор уведомления PK |
+| `client_id` | Идентификатор вызывающего сервиса; в паре с `idempotency_key` — UNIQUE |
+| `idempotency_key` | Ключ идемпотентности от клиента; защита от дубля при повторе HTTP |
+| `channel` | Канал доставки: `email`, `push` или `sms` |
+| `notification_type` | Тип уведомления; вместе с каналом определяет шаблон |
+| `payload` | JSON с параметрами для подстановки в шаблон |
+| `recipient_id` | Идентификатор получателя во внутренней системе (если передан) |
+| `recipient_address` | Адрес доставки: email, номер телефона или push-token |
+| `status` | Текущий статус: `created` → `processing` → `sent` \| `failed` |
+| `created_at` | Время создания записи (приём запроса) |
+| `update_at` | Время последнего изменения статуса или полей доставки |
 
 ### 7.2. `outbox_events` (очередь доставки и retry)
 
@@ -249,36 +187,22 @@ COMMIT;
 | `outbox_id` | UUID, PK (в пределах партиции) |
 | `notification_id` | FK |
 | `channel` | email \| push \| sms — по какому воркеру читать |
-| `event_type` | `send` — первая доставка; `retry` — повтор |
 | `status` | pending → processing → done \| dead |
 | `attempt_no` | номер попытки (1..N) |
 | `scheduled_at` | для retry: не обрабатывать раньше этого времени |
 | `created_at` | **ключ партиционирования** |
 | `processed_at` | когда задача завершена |
 
-Индекс для воркера:
-
-```sql
-CREATE INDEX idx_outbox_worker ON outbox_events (channel, status, scheduled_at, created_at)
-WHERE status = 'pending';
-```
-
 ### 7.3. `notification_history` (append-only)
 
 Каждое значимое изменение — **новая строка**, старые не обновляются.
 
-| Поле | Описание |
-|------|----------|
-| `history_id` | bigserial / UUID |
-| `notification_id` | |
-| `status` | снимок статуса в момент события |
-| `channel` | |
-| `event_type` | notification_created, status_processing, delivery_success, delivery_retry_scheduled, delivery_failed, … |
-| `attempt_no` | optional |
-| `error_code` | optional |
-| `created_at` | |
+| Поле | Описание                                                                                                         |
+|------|------------------------------------------------------------------------------------------------------------------|
+| `notification_id` | Идентификатор уведомления (FK)                                                                                   |
+| `snapshot` | JSONB-снимок состояния уведомления в момент события |
+| `created_at` | Время события                                                                                                    |
 
-История по ТЗ: API читает из этой таблицы (или join с `notifications`) с read-replica.
 
 ### 7.4. Диаграмма состояний уведомления
 
@@ -301,9 +225,8 @@ stateDiagram-v2
 
 При 20k RPS приёма outbox растёт **~20k строк/с** на `send` плюс строки `retry`. Без партиций:
 
-- раздувается B-tree индекса `idx_outbox_worker`;
-- autovacuum не успевает;
-- `SELECT FOR UPDATE` сканирует «хвост» огромной таблицы.
+- колличество данных в outbox сильно растет;
+- autovacuum перегружен;
 
 ### 8.2. Схема партиционирования
 
@@ -311,16 +234,7 @@ stateDiagram-v2
 
 ```sql
 CREATE TABLE outbox_events (
-  outbox_id       UUID NOT NULL,
-  notification_id UUID NOT NULL,
-  channel         TEXT NOT NULL,
-  event_type      TEXT NOT NULL,
-  status          TEXT NOT NULL,
-  attempt_no      INT  NOT NULL,
-  scheduled_at    TIMESTAMPTZ,
-  created_at      TIMESTAMPTZ NOT NULL,
-  processed_at    TIMESTAMPTZ,
-  PRIMARY KEY (outbox_id, created_at)
+  ...
 ) PARTITION BY RANGE (created_at);
 
 CREATE TABLE outbox_events_2026_05
@@ -328,285 +242,268 @@ CREATE TABLE outbox_events_2026_05
   FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
 ```
 
-| Практика | Описание |
-|----------|----------|
-| Создание партиций | Cron / pg_partman: партиция на текущий + следующий месяц |
-| Архив | Партиции старше 30–90 дней → DETACH → cold storage или DROP после TTL |
-| Retry | `scheduled_at` может попасть в следующий месяц — воркер читает **текущую и предыдущую** партицию |
 
-### 8.3. Жизненный цикл строки outbox
-
-| event_type | status (конец) | Смысл |
-|------------|----------------|-------|
-| send | done | первая доставка выполнена или переведена в retry |
-| retry | done | попытка обработана |
-| retry | pending (новая строка) | создана при ошибке провайдера |
-| * | dead | исчерпан лимит, ручной разбор |
+Создание партиций -  Cron / pg_partman: партиция на текущий + следующий месяц
+Архив - Партиции старше 30–90 дней → DETACH → cold storage или DROP после TTL
+Retry - `scheduled_at` может попасть в следующий месяц — воркер читает **текущую и предыдущую** партицию
 
 ---
 
-## 9. Обработка воркером: успех, retry, failed
+## 10. Детальные сценарии
 
-### 9.1. Успешная доставка
-
-После `250 OK` / `200 OK` от провайдера:
-
-```sql
-BEGIN;
-UPDATE notifications SET status = 'sent', sent_at = now(),
-  provider_message_id = :ext_id, last_error = NULL
-WHERE notification_id = :nid;
-
-UPDATE outbox_events SET status = 'done', processed_at = now()
-WHERE outbox_id = :oid;
-
-INSERT INTO notification_history (..., event_type = 'delivery_success', ...);
-COMMIT;
-```
-
-### 9.2. Retryable ошибка → новая строка outbox
-
-Провайдер вернул 503 / timeout / 429 (после классификации):
-
-```sql
-BEGIN;
-
-UPDATE outbox_events SET status = 'done', processed_at = now() WHERE outbox_id = :current;
-
-UPDATE notifications SET attempt_count = attempt_count + 1, last_error = 'PROVIDER_503'
-WHERE notification_id = :nid;
-
-INSERT INTO outbox_events (
-  outbox_id, notification_id, channel,
-  event_type, status, attempt_no, scheduled_at, created_at
-) VALUES (
-  ..., :nid, 'sms', 'retry', 'pending', :attempt_no + 1,
-  now() + interval '5 seconds',
-  now()
-);
-
-INSERT INTO notification_history (..., event_type = 'delivery_retry_scheduled', ...);
-
-COMMIT;
-```
-
-Воркер **не sleep'ит** — следующая попытка подхватится, когда `scheduled_at <= now()`.
-
-**Политика по умолчанию:** `max_attempts = 5`, backoff `[1s, 5s, 15s, 60s, 300s]`.
-
-### 9.3. Fatal → failed
-
-400, невалидный адрес, `MESSAGE_TOO_LARGE`:
-
-```sql
-UPDATE notifications SET status = 'failed', failed_at = now(), last_error = :code;
-UPDATE outbox_events SET status = 'dead', processed_at = now();
-INSERT INTO notification_history (..., 'delivery_failed', ...);
-```
-
-Новая строка outbox **не создаётся**.
-
-### 9.4. Классификация ошибок
-
-| Класс | Примеры | Действие |
-|-------|---------|----------|
-| Retryable | 429, 502, 503, timeout | outbox `retry` |
-| Fatal | 400, 401, invalid address | `failed` |
-| Unknown 5xx | после N retryable | `failed` + outbox dead |
+Ниже — пошаговое поведение системы для четырёх типовых случаев.  
+**Предусловие для всех сценариев доставки:** активный шаблон и конфигурация канала есть в Control Plane; `max_attempts = 5`, backoff `[1s, 5s, 15s, 60s, 300s]` (из Provider Config Service).
 
 ---
 
-## 10. Rate limiter и Circuit Breaker (на воркере)
+### 10.1. Полностью успешный сценарий
 
-Каждый **Provider Worker** использует **отдельный Redis** (или отдельный keyspace) для операционных счётчиков — **не тот же Redis**, что у Validation Service.
+**Контекст:** сервис заказов отправляет email «Заказ отправлен» (`notification_type = order_shipped`, канал `email`).
 
-### 10.1. Rate limiter
+| Шаг | Участник | Действие                                                                                                                                                                                                      |
+|-----|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 | Клиент → LB → Validation | `POST /v1/notifications` + заголовок `Idempotency-Key: ord-9912-1`. Redis: ключа нет                                                                                                                          |
+| 2 | Validation | Проверка JSON, канала, шаблона, параметров (`tracking_url`, `order_id`) — OK                                                                                                                                  |
+| 3 | Validation → Notification Service | `POST /internal/v1/notifications`                                                                                                                                                                             |
+| 4 | Notification Service | **Одна транзакция:** `notifications.status = created`; outbox: `event_type = send`, `status = pending`, `attempt_no = 1`; history: `snapshot = { "status": "created", "event": "notification_created", ... }` |
+| 5 | Validation → Клиент | **202** `{ notification_id, status: "created", created_at }`; в Redis: `idemp:{client_id}:ord-9912-1` → тот же ответ                                                                                          |
+| 6 | Email Worker | `SELECT … FOR UPDATE SKIP LOCKED` — захват строки outbox (`channel = email`, `pending`)                                                                                                                       |
+| 7 | Email Worker | Транзакция: outbox → `processing`; `notifications.status = processing`; history: `snapshot.event = status_processing`                                                                                         |
+| 8 | Email Worker | Рендер шаблона; конфиг SMTP из Provider Config Service (кэш); rate limit OK, breaker **closed**                                                                                                               |
+| 9 | Email Worker → SMTP | Вызов провайдера → **200 OK**, `provider_message_id = smtp-abc`                                                                                                                                               |
+| 10 | Email Worker | Транзакция: `notifications.status = sent`, `update_at = now()`; outbox → `done`; history: `snapshot.event = delivery_success`                                                                                 |
 
-| Уровень | Реализация |
-|---------|------------|
-| Локальный | Token bucket на инстансе (быстрый отказ) |
-| Кластерный | Периодическая синхронизация с Redis (`INCR` + TTL окна) |
-| Лимиты | Задаются в Control Plane per channel (email: 2000/s, sms: 100/s, …) |
+**Итог:** одно уведомление, одна строка outbox (`send` → `done`), три записи в history (created → processing → success). Клиент может получить `GET /v1/notifications/{id}` → `status: sent`.
 
-Если лимит исчерпан **до** вызова провайдера: outbox откатывается `processing` → `pending`, `scheduled_at = now() + 1s`.
+```mermaid
+sequenceDiagram
+    participant C as Клиент
+    participant V as Validation
+    participant N as Notification Service
+    participant W as Email Worker
+    participant P as SMTP
 
-### 10.2. Circuit breaker
-
-Состояния per channel: **closed** → **open** → **half-open**.
-
-| Состояние | Поведение |
-|-----------|-----------|
-| closed | нормальные вызовы |
-| open (>50% ошибок за 30 s) | провайдер не вызывается; сразу outbox `retry` с backoff |
-| half-open (через 20 s) | пробные вызовы |
-
-Email и SMS — **разные** breaker'ы; падение SMS не открывает breaker email.
-
----
-
-## 11. История уведомлений
-
-### 11.1. Когда пишется запись
-
-| Событие | event_type в history |
-|---------|----------------------|
-| Создание в Notification Service | `notification_created` |
-| Воркер взял задачу | `status_processing` |
-| Успех провайдера | `delivery_success` |
-| Запланирован retry | `delivery_retry_scheduled` |
-| Финальный отказ | `delivery_failed` |
-
-Каждый `INSERT` — в **той же транзакции**, что и `UPDATE notifications` / outbox.
-
-### 11.2. API истории
-
-```http
-GET /v1/notifications?recipient_id=user-9912&from=2026-05-01&to=2026-05-18
-```
-
-Чтение с **read-replica**; допустимое отставание 1–2 с.
-
-```json
-{
-  "items": [{
-    "notification_id": "550e8400-...",
-    "channel": "sms",
-    "status": "sent",
-    "created_at": "2026-05-18T10:00:00Z",
-    "sent_at": "2026-05-18T10:00:06Z",
-    "timeline": [
-      { "at": "...", "status": "created", "event": "notification_created" },
-      { "at": "...", "status": "processing", "event": "status_processing" },
-      { "at": "...", "status": "processing", "event": "delivery_retry_scheduled", "attempt": 2 },
-      { "at": "...", "status": "sent", "event": "delivery_success", "attempt": 3 }
-    ]
-  }]
-}
+    C->>V: POST /v1/notifications
+    V->>N: POST /internal/...
+    N-->>V: 202 created
+    V-->>C: 202
+    W->>N: захват outbox send
+    W->>P: отправка
+    P-->>W: 200 OK
+    W->>N: sent + outbox done
 ```
 
 ---
 
-## 12. Детальные сценарии
+### 10.2. Сценарий с retry и переходом в success
 
-### 12.1. Успешная отправка email (сквозной)
+**Контекст:** сервис авторизации отправляет SMS с кодом входа (`notification_type = login_otp`, канал `sms`); провайдер дважды отвечает **503**, на третьей попытке — **200**.
 
-**Предусловие:** шаблон `order_shipped` / email / v3.
+| Шаг | Участник | Действие |
+|-----|----------|----------|
+| 1 | Клиент → LB → Validation | `POST /v1/notifications` + `Idempotency-Key: auth-7721`. Redis: ключа нет |
+| 2 | Validation | Проверка JSON, канала `sms`, шаблона, параметров (`code`, `minutes`) — OK |
+| 3 | Validation → Notification Service | `POST /internal/v1/notifications` |
+| 4 | Notification Service | **Одна транзакция:** `notifications.status = created`; outbox: `send`, `pending`, `attempt_no = 1`; history: `notification_created` |
+| 5 | Validation → Клиент | **202** `{ notification_id, status: "created" }`; фиксация ключа в Redis |
+| 6 | SMS Worker | Захват outbox `send` → `processing`; `notifications.status = processing` |
+| 7 | SMS Worker → SMS API | **Попытка 1** → **503** → outbox `done`, новый `retry` (`attempt_no = 2`, `+1s`); history: `delivery_retry_scheduled` |
+| 8 | SMS Worker → SMS API | **Попытка 2** → **503** → та же схема: outbox `done`, `retry` (`attempt_no = 3`, `+5s`) |
+| 9 | SMS Worker → SMS API | **Попытка 3** → **200 OK** → `notifications.status = sent`; outbox `done`; history: `delivery_success` |
 
-1. **Клиент → LB → Validation Service.** Redis miss. Проверка payload OK.
-2. **Validation → Notification Service.** Транзакция: `notifications(created)`, outbox(`send`, pending), history(`notification_created`). **202** клиенту.
-3. **Email Worker:** `SELECT outbox … FOR UPDATE SKIP LOCKED` → `processing` + history.
-4. Рендер: subject `Заказ A-42 отправлен`, body с `tracking_url`.
-5. Rate limit OK, breaker closed, SMTP **250 OK**.
-6. `notifications(sent)`, outbox(done), history(`delivery_success`).
+**Итог:** одно уведомление, три строки outbox (`send` + 2× `retry`, все `done`); пользователь получил **одно** SMS. В history: `notification_created` → `status_processing` → 2× `delivery_retry_scheduled` → `delivery_success`.
 
-### 12.2. Идемпотентный повтор HTTP
+```mermaid
+sequenceDiagram
+    participant C as Клиент
+    participant V as Validation
+    participant N as Notification Service
+    participant W as SMS Worker
+    participant P as SMS API
 
-1. Первый запрос прошёл — в Redis Validation: `idemp:order-service:key-1` → `{ notification_id, status: sent }`.
-2. Повтор с тем же `Idempotency-Key` — Validation **не вызывает** Notification Service, **200/202** с тем же телом.
-3. Новых строк outbox **нет** — второго письма нет.
-
-### 12.3. SMS OTP с retry (503 → 503 → 200)
-
-Шаблон: `Код входа: {{.code}}. Действует {{.minutes}} мин.`
-
-| # | outbox | attempt | Провайдер | notifications.status |
-|---|--------|---------|-----------|------------------------|
-| 1 | send, pending→done | 1 | 503 | processing + history retry_scheduled |
-| 2 | retry, scheduled +1s | 2 | 503 | processing |
-| 3 | retry, scheduled +5s | 3 | **200** | **sent** |
-
-После каждой ошибки — **новая строка** outbox `event_type=retry`, старая → `done`.
-
-### 12.4. Circuit breaker при «шторме» 503
-
-1. SMS Worker фиксирует >50% ошибок за 30 s → breaker **open**.
-2. Новые захваты outbox: провайдер **не вызывается**, сразу outbox retry с backoff.
-3. Через 20 s — half-open, пробные отправки.
-4. Email Worker в это время работает штатно.
-
-### 12.5. Fatal: невалидный номер
-
-Рендер OK → SMS API **400** → `failed`, outbox **dead**, history `delivery_failed`, retry **не создаётся**.
-
-### 12.6. Обновление шаблона (Control Plane)
-
-1. Администратор сохраняет новую версию шаблона `order_shipped` / email.
-2. Rolling restart email-воркеров с загрузкой шаблонов из PostgreSQL.
-3. Уже принятые уведомления используют `template_version`, зафиксированную при создании в Notification Service.
+    C->>V: POST /v1/notifications
+    V->>N: POST /internal/...
+    N-->>V: 202 created
+    V-->>C: 202
+    W->>N: захват outbox send
+    W->>P: попытка 1
+    P-->>W: 503
+    W->>N: outbox done + retry (+1s)
+    W->>N: захват outbox retry #2
+    W->>P: попытка 2
+    P-->>W: 503
+    W->>N: outbox done + retry (+5s)
+    W->>N: захват outbox retry #3
+    W->>P: попытка 3
+    P-->>W: 200 OK
+    W->>N: sent + outbox done
+```
 
 ---
 
-## 13. Предотвращение дублей
+### 10.3. Сценарий с retry и переходом в fail
 
-| Уровень | Механизм |
-|---------|----------|
-| Повтор HTTP | Redis Validation + UNIQUE(client_id, idempotency_key) в PG |
-| Два воркера взяли одну задачу | `FOR UPDATE SKIP LOCKED` на строке outbox |
-| Повторная обработка done outbox | outbox только `pending`; уведомление уже `sent` |
-| Провайдер OK, воркер упал | `provider_message_id` + Redis lock `send:{notification_id}` на время вызова |
+**Контекст:** SMS с кодом входа (`channel = sms`); провайдер на каждой попытке отвечает **503**; после 5-й попытки лимит `max_attempts` исчерпан → `failed`.
 
----
+| Шаг | Участник | Действие |
+|-----|----------|----------|
+| 1 | Клиент → LB → Validation | `POST /v1/notifications` + `Idempotency-Key: auth-9900`. Redis: ключа нет |
+| 2 | Validation | Проверка запроса — OK |
+| 3 | Validation → Notification Service | `POST /internal/v1/notifications` |
+| 4 | Notification Service | `notifications.status = created`; outbox `send`, `pending`, `attempt_no = 1`; history: `notification_created` |
+| 5 | Validation → Клиент | **202**; фиксация ключа в Redis |
+| 6 | SMS Worker | Захват outbox `send` → `processing` |
+| 7 | SMS Worker → SMS API | **Попытка 1** → **503** → outbox `done`, `retry` (`attempt_no = 2`, `+1s`) |
+| 8 | SMS Worker → SMS API | **Попытки 2–4** → каждая **503**; после каждой: outbox `done`, новый `retry` (`+5s`, `+15s`, `+60s`) |
+| 9 | SMS Worker → SMS API | **Попытка 5** → **503**; `attempt_no >= max_attempts` |
+| 10 | SMS Worker | `notifications.status = failed`; outbox → **`dead`**; history: `delivery_failed`. Новый outbox **не создаётся** |
 
-## 14. Масштабирование и отказоустойчивость
+**Итог:** пять строк outbox (`send` + 4× `retry` в `done`, последняя в `dead`); SMS пользователю не доставлено. Клиент: `GET /v1/notifications/{id}` → `status: failed`.
 
-| Контур | Масштабирование |
-|--------|-----------------|
-| LB | горизонтально |
-| Validation Service | 4–8 инстансов за LB |
-| Notification Service (HTTP) | 4–6 инстансов |
-| Email / Push / SMS workers | независимо, по lag outbox per channel |
+```mermaid
+sequenceDiagram
+    participant C as Клиент
+    participant V as Validation
+    participant N as Notification Service
+    participant W as SMS Worker
+    participant P as SMS API
 
-| Сбой | Поведение |
-|------|-----------|
-| Validation down | LB health check, трафик на живые инстансы |
-| Redis Validation down | Fallback на UNIQUE в PostgreSQL (выше latency) |
-| Notification down после Validation | Клиент 502; при повторе idempotency спасает от дубля |
-| Worker down | Строки outbox pending; другие инстансы подхватят |
-| PostgreSQL primary | Patroni failover; outbox и notifications на primary |
-
----
-
-## 15. Технологический стек
-
-| Слой | Технологии |
-|------|------------|
-| Validation Service | Go, `chi`, go-redis |
-| Notification Service + Workers | Go, `chi`, `pgx`, `text/template` |
-| БД | PostgreSQL 16, Patroni, партиции outbox (pg_partman) |
-| Redis | Два контура: Validation idempotency; workers rate limit |
-| Метрики | Prometheus |
-| LB | HAProxy |
-
-**Метрики:** `notify_accept_total`, `notify_outbox_pending{channel}`, `notify_outbox_lag_seconds`, `notify_delivery_total`, `notify_retry_total`, `notify_circuit_breaker_state{channel}`, `notify_history_writes_total`.
-
----
-
-## 16. Обоснование архитектуры
-
-**Почему Validation Service отдельно.** Идемпотентность и лёгкая валидация в отдельном сервисе с **собственным Redis** разгружают основной сервис и масштабируются отдельно от воркеров.
-
-**Почему outbox, а не Kafka.** Задача на доставку в **той же транзакции**, что и факт приёма. Воркеры конкурируют за строки через `SKIP LOCKED`; retry — **новая строка** outbox.
-
-**Почему партиции outbox.** При 20k RPS таблица outbox без партиций становится узким местом vacuum и индекса.
-
-**Почему history append-only.** ТЗ требует историю; каждое изменение статуса auditable.
+    C->>V: POST /v1/notifications
+    V->>N: POST /internal/...
+    N-->>V: 202 created
+    V-->>C: 202
+    W->>N: захват outbox send
+    W->>P: попытка 1
+    P-->>W: 503
+    W->>N: retry #2 (+1s)
+    W->>N: захват retry #2
+    W->>P: попытка 2
+    P-->>W: 503
+    W->>N: retry #3 (+5s)
+    W->>N: захват retry #3
+    W->>P: попытка 3
+    P-->>W: 503
+    W->>N: retry #4 (+15s)
+    W->>N: захват retry #4
+    W->>P: попытка 4
+    P-->>W: 503
+    W->>N: retry #5 (+60s)
+    W->>N: захват retry #5
+    W->>P: попытка 5
+    P-->>W: 503
+    W->>N: failed + outbox dead
+```
 
 ---
 
-## 17. Компромиссы
+### 10.4. Дубликат (повтор HTTP-запроса)
 
-| Решение | Плюс | Минус |
-|---------|------|-------|
-| Outbox в PostgreSQL вместо Kafka | Транзакционность с `notifications` | Нагрузка на PG; нужны партиции |
-| SELECT FOR UPDATE на outbox | Нет дублей задач между воркерами | Конкуренция за индекс |
-| Отдельный Redis для Validation | Изоляция от rate limit воркеров | Два Redis-контура |
-| Retry = новая строка outbox | Понятный аудит | Больше строк |
-| История на каждое изменение | Полный audit trail | Рост таблицы history |
+**Контекст:** клиент отправил тот же запрос дважды с одним `Idempotency-Key` (таймаут сети, retry на стороне клиента).
+
+| Шаг | Запрос | Что происходит |
+|-----|--------|----------------|
+| **Первый** | `Idempotency-Key: pay-44` | Redis miss → Validation → Notification Service → **202**, `notification_id = N-1`. Redis: `SET idemp:...` → `{ notification_id: N-1, status: created, ... }` |
+| **Второй** | тот же ключ | Redis **hit** → Validation **не вызывает** Notification Service |
+| **Ответ второго** | — | **200/202** с тем же телом, что и у первого (`notification_id = N-1`) |
+
+**Итог:** пользователь не получает второе сообщение; воркер обрабатывает outbox только один раз. Если Redis недоступен — срабатывает запасной механизм: `UNIQUE(client_id, idempotency_key)` в PostgreSQL отклонит повторную вставку, Validation вернёт сохранённый результат (выше latency).
+
+```mermaid
+sequenceDiagram
+    participant C as Клиент
+    participant V as Validation
+    participant R as Redis
+    participant N as Notification Service
+
+    C->>V: POST (1-й раз)
+    V->>R: GET idemp — miss
+    V->>N: создать уведомление
+    N-->>V: 202
+    V->>R: SET idemp
+    V-->>C: 202
+
+    C->>V: POST (2-й раз, тот же ключ)
+    V->>R: GET idemp — hit
+    V-->>C: 202 (тот же notification_id)
+    Note over N: Notification Service не вызывается
+```
 
 ---
 
-## 18. Ограничения и развитие
+## 11. Архитектура приёма, маршрутизации и отправки уведомлений
 
-Не проектируются: публичная аутентификация (mTLS), UI админки, webhook статусов.
+- **Приём:** `LB → Validation → Notification Service` — валидация, идемпотентность, запись `notifications` + outbox, ответ **202** (P95 ≤ 100 ms).
+- **Маршрутизация:** канал в запросе (`email` / `push` / `sms`); воркер забирает из outbox только свои задачи (`WHERE channel = …`).
+- **Отправка:** Provider Worker → рендер → провайдер; retry — новая строка outbox, результат — `sent` / `failed`.
 
-Развитие: autovacuum tuning для партиций, read-модель history в ClickHouse, приоритетный outbox для OTP (`priority` column).
+---
+
+## 12. Подход к работе с шаблонами
+
+- **Хранение:** шаблоны в Control Plane по паре `(notification_type, channel)` с версией; у каждого канала свой формат (subject/body для email, текст SMS, заголовок push).
+- **При приёме:** проверяем, что активный шаблон есть и все `required_params` переданы в `payload`;
+- **При отправке:** воркер рендерит сообщение из шаблона и `payload` уже принятого уведомления.
+
+---
+
+## 13. Подход к хранению истории уведомлений
+
+- **Модель:** таблица `notification_history` append-only — каждое событие новая строка (`notification_id`, `snapshot` JSONB, `created_at`); старые записи не меняются.
+- **Запись:** снимок пишется в той же транзакции, что и смена статуса (`created`, `processing`, retry, `sent`, `failed`).
+- **Чтение:** по notification_id и timestamp
+
+---
+
+## 14. Подход к масштабированию и обеспечению отказоустойчивости
+
+Система проектируется под пик **20 000 RPS** на приём и неравномерную нагрузку на доставку. Масштабируются **отдельные контуры**, а не монолит целиком.
+
+### 14.1. Масштабирование
+
+| Контур | Как масштабируется | Зачем отдельно |
+|--------|-------------------|----------------|
+| Load Balancer | Горизонтально (active/active) | Рост входящего HTTP |
+| Validation Service | 4–8 инстансов за LB | Лёгкая валидация и Redis; разгрузка Notification Service |
+| Notification Service (HTTP) | 4–6 инстансов | Запись в PostgreSQL на приёме |
+| Email / Push / SMS workers | Независимо, по lag outbox на канал | У email и SMS разная нагрузка и лимиты провайдеров |
+| Provider Config Service | 2 инстанса, read-heavy | Конфиг не на критическом пути приёма |
+| PostgreSQL (outbox) | Партиции по `created_at` (помесячно) | Чтобы индекс и vacuum не деградировали на 20k+ строк/с |
+| История | Read-replica для `GET` | Запись на primary, чтение не мешает приёму |
+
+Все сервисы приёма и воркеры **stateless**: состояние — в PostgreSQL, Redis и Provider Config Service. Sticky sessions на LB **не нужны**. Воркеры конкурируют за outbox через `SELECT … FOR UPDATE SKIP LOCKED` — добавление инстанса увеличивает пропускную способность канала без координации между ними.
+
+### 14.2. Отказоустойчивость
+
+| Сбой | Поведение системы |
+|------|-------------------|
+| Падение инстанса Validation / Notification | LB исключает инстанс по health check; трафик на оставшиеся |
+| Redis Validation недоступен | Fallback на `UNIQUE(client_id, idempotency_key)` в PostgreSQL — выше latency, дубли не создаются |
+| Notification Service недоступен после Validation | Клиент получает **502**; повтор с тем же `Idempotency-Key` не создаёт второе уведомление |
+| Падение Provider Worker | Строки outbox остаются `pending`; другие воркеры того же канала подхватывают задачи |
+| Provider Config Service недоступен | Воркер работает на последнем кэше; без кэша — откладывает задачу (`scheduled_at`) |
+| Временная недоступность провайдера (503) | Retry через новые строки outbox; circuit breaker снижает «шторм» запросов |
+| Падение PostgreSQL primary | Patroni failover; `notifications` и outbox на primary — после переключения воркеры продолжают с `pending` |
+| Проблемы одного канала | Email, push и SMS изолированы: отдельные воркеры, лимиты и circuit breaker |
+
+**Главный принцип:** факт приёма фиксируется синхронно в одной транзакции с outbox; доставка — асинхронно и переживает рестарты воркеров. Принятое уведомление не теряется, пока строка outbox в статусе `pending` или `retry`.
+
+---
+
+## 15. Основные компромиссы выбранного решения
+
+| Решение | Плюс | Минус                                                                                         |
+|---------|------|-----------------------------------------------------------------------------------------------|
+| **Outbox в PostgreSQL** | Транзакционность с `notifications` — нет dual-write; проще эксплуатация (одна СУБД) | Высокая нагрузка на PostgreSQL; обязательны партиции outbox и tuning vacuum                   |
+| **`SELECT FOR UPDATE SKIP LOCKED`** на outbox | Нет дублей задач между воркерами; не нужен отдельный брокер | дополнительно нагружает autovacuum                                                            |
+| **Отдельный Validation Service + Redis** | Приём и идемпотентность масштабируются отдельно от доставки | новая точка падения                                                                           |
+| **History append-only + JSONB snapshot** | Полный audit trail; гибкая схема событий в `snapshot` | Рост таблицы history; для аналитики на годах — архив или выгрузка                             |
+| **Provider Config Service отдельно** | Смена лимитов и endpoint без рестарта воркеров | Задержка применения до TTL кэша (30–60 с); ещё один сервис в эксплуатации                     |
+| **Асинхронная доставка** | P95 приёма ≤ 100 ms при 20k RPS | Клиент не узнаёт об успехе/ошибке провайдера в том же HTTP-ответе — только по статусу/history |
+
+Глобально есть проблема с большой нагрузкой на бд. Для того чтобы выдерживать большие нагрузки необходимо разносить уведомления, outbox, историчность по разным бд, однако это значительно усложняет систему. 
+Разделить бд уведомлений на шарды или архивную бд чтобы распределить нагрузку. 
+Также можно применить append only transactional outbox что значительно уменьшит нагрузку на autovacuum и позволит ращгрузить бд.
+
+
+**Что сознательно не входит в scope:** публичная аутентификация (mTLS между сервисами), UI админки, webhook статусов наружу — это упрощает первую версию, но перекладывает интеграцию на polling (`GET`) со стороны клиентов.
+
