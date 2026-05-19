@@ -22,11 +22,10 @@
 |--------|-------------|
 | Уведомление | Сущность с идентификатором, получателем, каналом, типом и жизненным циклом доставки. |
 | Канал доставки | Способ отправки: `email`, `push`, `sms`. У каждого канала свои лимиты на размер и формат сообщения. |
-| Тип уведомления | Логический код события (`order_shipped`, `password_reset`), по которому выбирается шаблон. |
 | Шаблон | Текстовая заготовка с плейсхолдерами; компилируется при старте воркера. |
 | Провайдер | Внешний API доставки (SMTP-шлюз, FCM/APNs, SMS-агрегатор). |
 | Idempotency key | Ключ, который клиент передаёт для защиты от повторного создания при ретрае HTTP. |
-| Outbox | Таблица исходящих событий: запись в БД и публикация в брокер в одной транзакции. |
+| Enqueue Worker | Сервис, который забирает уведомления со статусом `created`, переводит в `processing` и публикует в Kafka. |
 | Retry | Повторная попытка отправки после временной ошибки провайдера. |
 | Rate limiting | Ограничение скорости вызовов провайдера и/или приёма по клиенту. |
 | Deduplication | Гарантия, что одно логическое уведомление не уйдёт пользователю дважды. |
@@ -54,7 +53,7 @@
 |---------|------------|---------------------------|
 | Нагрузка | до 20 000 RPS на приём в пике | Горизонтально масштабируемый stateless Ingest, партиционированная очередь |
 | Latency приёма | P95 ≤ 100 мс | Нет синхронного вызова провайдера в HTTP-обработчике; минимум обращений к БД |
-| Надёжность | не терять принятые уведомления | Транзакция «запись + outbox», Kafka с репликацией, идемпотентные воркеры |
+| Надёжность | не терять принятые уведомления | Запись `created` при приёме; Enqueue Worker с `FOR UPDATE SKIP LOCKED`; Kafka с репликацией; идемпотентные consumer |
 | Консистентность | надёжный факт приёма; история — eventual | Запись в primary PostgreSQL; проекция истории может отставать на секунды |
 | Масштабирование | отдельно: приём, маршрутизация, каналы, история | Разные consumer groups и пулы воркеров |
 | Ограничения | rate limit, изоляция каналов | Отдельные топики/воркеры и circuit breaker на провайдер |
@@ -66,10 +65,11 @@
 ### Сценарий 1: Успешная отправка
 
 1. Сервис заказов вызывает `POST /v1/notifications` с типом `order_shipped`, каналом `email`, `recipient_id` и параметрами `{ "order_id": "A-42" }`.
-2. Ingest проверяет запрос, создаёт уведомление со статусом `created`, ставит задачу в очередь.
+2. Ingest проверяет запрос и сохраняет уведомление со статусом `created`.
 3. Клиент получает `202 Accepted` и `notification_id`.
-4. Воркер email подставляет шаблон, отправляет письмо через SMTP-шлюз, переводит статус в `sent`.
-5. При запросе истории пользователь видит запись с каналом, временем и статусом `sent`.
+4. Enqueue Worker переводит запись в `processing` и публикует событие в Kafka.
+5. Email-воркер подставляет шаблон, отправляет письмо через SMTP-шлюз, переводит статус в `sent`.
+6. При запросе истории пользователь видит запись с каналом, временем и статусом `sent`.
 
 ### Сценарий 2: Повтор HTTP-запроса клиентом
 
@@ -115,6 +115,17 @@
 | `attempt_count` | int | Число попыток отправки |
 | `last_error` | string, optional | Код/текст последней ошибки |
 | `provider_message_id` | string, optional | ID у провайдера |
+| `processing_at` | timestamptz, optional | Момент перевода в `processing` (Enqueue Worker) |
+
+Индекс для постановки в очередь: `(status, created_at) WHERE status = 'created'`.
+
+**Смысл статусов в этой архитектуре**
+
+| Статус | Значение |
+|--------|----------|
+| `created` | Принято Ingest, **ещё не** опубликовано в Kafka |
+| `processing` | Захвачено Enqueue Worker, событие в Kafka (или ожидает доставки Channel Worker) |
+| `sent` / `failed` | Финальный результат вызова провайдера |
 
 **DeliveryAttempt** (аудит попыток, защита от двойной отправки на уровне воркера):
 
@@ -191,11 +202,11 @@ X-Client-Id: order-service
 
 Архитектура разбита на три схемы: общий поток данных, маршрутизация по каналам и связь компонентов с хранилищами.
 
-**Общий поток:** клиент → приём → очередь → доставка → провайдер. Запись в PostgreSQL выполняется на приёме и при смене статуса.
+**Общий поток:** клиент → Ingest (`created`) → Enqueue Worker (`processing` + Kafka) → Channel Workers → провайдер. Отдельной таблицы outbox нет: роль очереди на приёме выполняют статус и Enqueue Worker.
 
 ![Общая архитектура — поток данных](diagrams/02-architecture-overview.png)
 
-**Маршрутизация по каналам:** Dispatcher направляет сообщение в топик email, push или sms; у каждого канала свой пул воркеров и свой провайдер.
+**Маршрутизация по каналам:** Enqueue Worker публикует сразу в топик `notifications.email`, `notifications.push` или `notifications.sms` по полю `channel`.
 
 ![Маршрутизация по каналам доставки](diagrams/02-architecture-channels.png)
 
@@ -206,21 +217,39 @@ X-Client-Id: order-service
 ### 7.1. Компоненты
 
 **Ingest (stateless, Go)**  
-HTTP-сервер: валидация JSON, проверка idempotency, INSERT в `notifications` + `outbox_events` в одной транзакции, фоновая публикация outbox в Kafka. Ответ клиенту — сразу после commit в PostgreSQL. Отдельный процесс **Outbox Relay** может читать `outbox_events`, если публикация не встроена в тот же сервис — в решении заложен встроенный relay-воркер в каждом инстансе Ingest с захватом строк через `FOR UPDATE SKIP LOCKED`.
+HTTP-сервер: валидация JSON, проверка idempotency, один `INSERT` в `notifications` со статусом `created`. Ответ клиенту — сразу после `COMMIT`. **Kafka на этом этапе не вызывается** — так сохраняется P95 ≤ 100 мс.
+
+**Enqueue Worker (stateless, Go, горизонтально масштабируется)**  
+Цикл постановки в брокер без таблицы outbox:
+
+```sql
+BEGIN;
+SELECT notification_id, channel, ... 
+FROM notifications
+WHERE status = 'created'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+
+UPDATE notifications
+SET status = 'processing', processing_at = now()
+WHERE notification_id = :id AND status = 'created';
+COMMIT;
+```
+
+После успешного `COMMIT` — `publish` в Kafka (топик по `channel`). Ключ сообщения: `notification_id`.
+
+> **Важно:** Kafka не участвует в транзакции PostgreSQL. Сначала фиксируем `processing` в БД, затем публикуем в брокер. Если publish не удался — `UPDATE status = 'created'` для отката (см. §7.2). Отдельная outbox-таблица не нужна: роль «задачи на публикацию» выполняет множество строк со статусом `created`.
 
 **Kafka**  
 Топики:
 
-- `notifications.incoming` — все принятые уведомления (ключ партиции: `notification_id`);
-- `notifications.email` / `notifications.push` / `notifications.sms` — после маршрутизации;
-- `notifications.retry.{channel}` — отложенные повторы;
-- `notifications.dlq.{channel}` — сообщения после исчерпания retry для ручного разбора.
-
-**Dispatcher**  
-Лёгкий consumer: читает `incoming`, проверяет канал, пишет в канальный топик. Не вызывает провайдеров. Масштабируется отдельно от Ingest и от воркеров.
+- `notifications.email` / `notifications.push` / `notifications.sms` — публикация из Enqueue Worker;
+- `notifications.retry.{channel}` — отложенные повторы Channel Worker;
+- `notifications.dlq.{channel}` — ручной разбор после исчерпания retry.
 
 **Channel Workers**  
-Consumer group на канал. Пайплайн: claim → `processing` → render template → rate limit → dedup lock → provider → `sent`/`retry`/`failed`. При падении инстанса партиция перераспределяется, обработка продолжается с учётом идемпотентности.
+Consumer group на канал. Статус уже `processing`. Пайплайн: render template → rate limit → dedup lock → provider → `sent` / retry / `failed`. Повторное сообщение из Kafka при `sent` — только commit offset.
 
 **History API**  
 `GET /v1/notifications` с фильтрами `recipient_id`, `channel`, `from`, `to`, `status`. Чтение с read-replica PostgreSQL; допустимое отставание реплики — до 1–2 с.
@@ -234,7 +263,20 @@ REST для CRUD шаблонов и лимитов провайдеров. Из
 - distributed lock `send:{notification_id}` на время вызова провайдера (TTL 30–60 с).
 
 **PostgreSQL**  
-Источник истины: уведомления, попытки, outbox, шаблоны. Кластер Patroni (3 узла), синхронная репликация на кворум для записи статуса `sent`/`failed`.
+Источник истины: уведомления, попытки, шаблоны. Кластер Patroni (3 узла). Очередь на постановку в Kafka — строки со статусом `created`.
+
+### 7.2. Постановка в Kafka без outbox (отказоустойчивость)
+
+| Ситуация | Поведение |
+|----------|-----------|
+| `COMMIT` прошёл, Kafka недоступна | Строка в `processing`, сообщения в брокере нет. Reconciler через T сек возвращает в `created`, если нет consumer lag по `notification_id`, либо повторный publish из `processing` |
+| Kafka ack, consumer уже обработал | Идемпотентность по `notification_id` в Channel Worker |
+| Enqueue Worker упал после `COMMIT`, до publish | Запись в `processing` без сообщения в Kafka — reconciler публикует повторно или откатывает в `created` |
+| Несколько Enqueue Worker | `FOR UPDATE SKIP LOCKED` — одна строка обрабатывается одним инстансом |
+
+Метрика вместо outbox lag: **`notify_created_queue_lag_seconds`** = `now() - min(created_at) WHERE status = 'created'`.
+
+![Постановка в Kafka через смену статуса](diagrams/08-seq-enqueue.png)
 
 ---
 
@@ -354,23 +396,29 @@ GET /v1/notifications?recipient_id=user-9912&from=2026-05-01&to=2026-05-18&limit
 
 ![Обновление шаблонов](diagrams/07-seq-template-update.png)
 
+### 12.5. Постановка в очередь (created → processing → Kafka)
+
+![Enqueue Worker: захват и публикация](diagrams/08-seq-enqueue.png)
+
 ---
 
 ## 13. Масштабирование и отказоустойчивость
 
 ### 13.1. Оценка ёмкости
 
-- Ingest на Go: порядка **4–6k RPS на ядро** при записи в PG + публикации в Kafka.  
-- Для **20k RPS** — **8–12 инстансов** Ingest за балансировщиком (запас на всплески).  
-- Kafka: **48–64 партиции** на `notifications.incoming` (ключ `notification_id`).  
-- Email/push/sms воркеры масштабируются **независимо** по фактической доле каналов (например, 60% email / 30% push / 10% sms).
+- Ingest на Go: порядка **6–8k RPS на ядро** (только INSERT `created`).  
+- Для **20k RPS** приёма — **4–6 инстансов** Ingest.  
+- Enqueue Worker: **4–8 инстансов**, тот же порядок RPS на захват + publish.  
+- Kafka: **32–48 партиций** на каждый канальный топик (ключ `notification_id`).  
+- Channel Workers масштабируются **независимо** по каналам.
 
 ### 13.2. Отказоустойчивость
 
 | Событие | Поведение |
 |---------|-----------|
 | Падение инстанса Ingest | LB убирает узел; клиент ретраит; idempotency защищает от дублей |
-| Недоступность Kafka | Ingest не отвечает 202 после commit без publish — outbox relay догоняет после восстановления |
+| Недоступность Kafka | Ingest продолжает писать `created`; Enqueue Worker копит lag, после восстановления догоняет |
+| Зависшие в `processing` | Reconciler откатывает в `created` или повторяет publish |
 | Падение SMS-воркеров | Email/push не затрагиваются |
 | Недоступность Redis | Rate limit по локальному буферу; dedup опирается на PostgreSQL |
 | Недоступность Control Plane | Приём и отправка работают; меняются только шаблоны |
@@ -379,7 +427,7 @@ GET /v1/notifications?recipient_id=user-9912&from=2026-05-01&to=2026-05-18&limit
 
 | Слой | Технологии |
 |------|------------|
-| Ingest, Dispatcher, Workers, History | Go, `chi`, `pgx`, `segmentio/kafka-go` |
+| Ingest, Enqueue Worker, Channel Workers, History | Go, `chi`, `pgx`, `segmentio/kafka-go` |
 | Шаблоны | `text/template` |
 | Брокер | Kafka (3+ брокера, replication factor 3) |
 | БД | PostgreSQL 16, Patroni |
@@ -398,9 +446,10 @@ GET /v1/notifications?recipient_id=user-9912&from=2026-05-01&to=2026-05-18&limit
 - `notify_retry_total{channel}`  
 - `notify_provider_errors_total{channel, code}`  
 - `notify_rate_limit_hits_total{channel}`  
-- `notify_outbox_lag_seconds`  
+- `notify_created_queue_lag_seconds`  
+- `notify_processing_stuck_total`  
 
-Алерты: рост `outbox_lag`, доля `failed` > порога по каналу, consumer lag > 30 с.
+Алерты: рост `created_queue_lag`, доля `failed` > порога по каналу, consumer lag > 30 с.
 
 ---
 
@@ -408,7 +457,9 @@ GET /v1/notifications?recipient_id=user-9912&from=2026-05-01&to=2026-05-18&limit
 
 **Почему асинхронная доставка.** Требование P95 ≤ 100 мс на приёме несовместимо с синхронным ожиданием SMTP/FCM/SMS-шлюза. Разделение «принять» и «доставить» — стандартный паттерн notification-платформ.
 
-**Почему Kafka, а не только очередь в PostgreSQL.** При 20k RPS LISTEN/NOTIFY или polling outbox как единственный транспорт между стадиями создаёт узкое место. Outbox гарантирует отсутствие потерь на границе Ingest → брокер; дальше Kafka даёт буфер, backpressure и независимое масштабирование consumer groups.
+**Почему Kafka после статуса `processing`.** Ingest только пишет `created` — быстрый приём. Enqueue Worker отдельно масштабируется и переводит задачи в брокер. Статус `created` — очередь на публикацию без отдельной outbox-таблицы. Kafka даёт буфер и изоляцию каналов на этапе доставки.
+
+**Почему не outbox.** Достаточно поля `status`: строки `created` — work queue для Enqueue Worker; `FOR UPDATE SKIP LOCKED` даёт конкурентную обработку. Меньше сущностей в модели данных при явном компромиссе: reconciler для пары `processing` + сбой Kafka (см. §7.2).
 
 **Почему отдельные воркеры на канал.** Разные лимиты провайдеров, разная стоимость ошибки и требование изоляции из §4.6. Один «универсальный» воркер при падении SMS-адаптера замедлил бы обработку email.
 
@@ -420,7 +471,8 @@ GET /v1/notifications?recipient_id=user-9912&from=2026-05-01&to=2026-05-18&limit
 
 | Решение | Плюс | Минус |
 |---------|------|-------|
-| Outbox + Kafka | Нет потерь, масштабируемая обработка | Операционная сложность брокера |
+| Статус `created` вместо outbox | Проще модель данных, одна таблица | Reconciler для `processing` при сбое Kafka; конкуренция за индекс `(status, created_at)` |
+| Разделение Ingest и Enqueue | Быстрый HTTP-приём | Дополнительный сервис и lag `created` → `processing` |
 | Шаблоны in-memory на воркере | Быстрый рендер | Rolling restart при изменениях |
 | Локальный rate limit + Redis | Низкая задержка, защита провайдера | Кратковременная рассинхронизация лимитов между узлами |
 | Effectively-once через БД + lock | Нет дублей для пользователя | Дополнительные записи и проверки |
