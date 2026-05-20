@@ -12,7 +12,7 @@
 - внешние провайдеры с лимитами и периодической недоступностью;
 - запрет на «случайные» дубли при повторных запросах клиента и при at-least-once доставке внутри платформы.
 
-Решение разделено на **Control Plane** (шаблоны, **Provider Config Service** — конфигурации провайдеров в отдельной БД) и **Data Plane** (балансировщик → сервис валидации → основной сервис уведомлений → воркеры провайдеров, outbox, история).
+Решение разделено на **Control Plane** (шаблоны, **Provider Config Service** — конфигурации провайдеров в отдельной БД) и **Data Plane** (балансировщик → сервис валидации → **Notification Service** с воркерами доставки, outbox, история). Таблицы `outbox_events` и `notification_history` — **партиционированы** по времени (§8, §7.3).
 
 ---
 
@@ -89,7 +89,7 @@
 | Latency приёма | P95 ≤ 100 мс | Провайдер не вызывается в HTTP; одна транзакция «уведомление + outbox» |
 | Надёжность | не терять принятые уведомления | Outbox в той же транзакции, что и `notifications`; воркеры `FOR UPDATE SKIP LOCKED` |
 | Консистентность | надёжный факт приёма; история — eventual | Primary для записи; `notification_history` append-only; чтение с replica |
-| Масштабирование | отдельно: приём, валидация, воркеры по каналам | Независимые пулы Validation / Notification / email / push / sms workers |
+| Масштабирование | отдельно: приём, валидация; воркеры — в составе Notification Service | Validation масштабируется отдельно; email/push/sms — отдельные пулы процессов внутри NS |
 | Ограничения | rate limit, изоляция каналов | Rate limiter + circuit breaker на воркер каждого провайдера |
 
 ---
@@ -150,14 +150,21 @@ flowchart LR
 
 > Ответ клиенту после создания: **202** с `notification_id`, `status`, `created_at`. Доставку выполняют **Provider Workers** (§7.4).
 
-### 7.4. Provider Workers
+### 7.4. Provider Workers (часть Notification Service)
 
-Асинхронная доставка: отдельный сервис **на канал** (email / push / sms). Каждый воркер обслуживает только своего провайдера.
+Provider Workers — **не отдельные микросервисы**, а **пулы процессов / deployment внутри Notification Service** (отдельный пул на канал: email, push, sms). Каждый пул обслуживает только своего провайдера и пишет в **ту же PostgreSQL**, что и HTTP-часть приёма.
+
+| | |
+|---|---|
+| **Плюс общей БД** | Транзакционный outbox: `notifications` + `outbox_events` + `notification_history` в одной транзакции при приёме и при смене статуса — без dual-write и отдельного брокера |
+| **Минус** | Меньше гибкости масштабирования «канал = свой микросервис со своей БД»; при проблемах с primary PostgreSQL затронуты все каналы (компенсация: Patroni, изоляция каналов на уровне воркеров и circuit breaker) |
+
+Масштабирование канала — **горизонтальное добавление инстансов** пула воркеров; конкуренция за задачи через `SKIP LOCKED`.
 
 | Задача | Что делает |
 |--------|------------|
-| **Захват задачи** | `SELECT … FOR UPDATE SKIP LOCKED` по outbox с фильтром своего канала (`pending`, `scheduled_at` готов) — без конкуренции между воркерами |
-| **Доставка** | Рендер шаблона → конфиг из Provider Config Service → rate limit и circuit breaker → вызов провайдера |
+| **Захват задачи** | `SELECT … FOR UPDATE SKIP LOCKED` по outbox с фильтром своего канала (`pending`, `scheduled_at` готов) |
+| **Доставка** | Рендер шаблона → конфиг из Provider Config Service → rate limit и circuit breaker (§9) → вызов провайдера |
 | **Результат** | Обновляет `notifications`, outbox и `notification_history`: `sent`, retry или `failed` |
 
 ---
@@ -182,6 +189,8 @@ flowchart LR
 
 ### 7.2. `outbox_events` (очередь доставки и retry)
 
+> **Возможная доработка:** вынести каналы в отдельные таблицы (`outbox_events_email`, `outbox_events_sms`, …) — меньше конкуренции за индекс при экстремальной нагрузке на один канал. В базовом решении достаточно одной таблицы с `channel` и partial-индексом `(channel, status, scheduled_at) WHERE status = 'pending'`.
+
 | Поле | Описание |
 |------|----------|
 | `outbox_id` | UUID, PK (в пределах партиции) |
@@ -195,13 +204,15 @@ flowchart LR
 
 ### 7.3. `notification_history` (append-only)
 
-Каждое значимое изменение — **новая строка**, старые не обновляются.
+Каждое значимое изменение — **новая строка**, старые не обновляются. Таблица **партиционирована** по `created_at` (тот же подход, что для outbox — §8).
 
 | Поле | Описание                                                                                                         |
 |------|------------------------------------------------------------------------------------------------------------------|
 | `notification_id` | Идентификатор уведомления (FK)                                                                                   |
 | `snapshot` | JSONB-снимок состояния уведомления в момент события |
-| `created_at` | Время события                                                                                                    |
+| `created_at` | Время события; **ключ партиционирования**                                                                      |
+
+> **Доработка (вне базового scope):** асинхронная репликация снимков в **отдельную БД** или аналитическое хранилище (ClickHouse и т.п.) — снять INSERT-нагрузку с primary при сохранении синхронной записи минимума в PostgreSQL для API.
 
 
 ### 7.4. Диаграмма состояний уведомления
@@ -223,29 +234,64 @@ stateDiagram-v2
 
 ### 8.1. Зачем партиционировать
 
-При 20k RPS приёма outbox растёт **~20k строк/с** на `send` плюс строки `retry`. Без партиций:
+При 20k RPS приёма outbox растёт **~20k строк/с** на `send` плюс строки `retry`; `notification_history` — несколько INSERT на уведомление. Без партиций на **outbox** и **history**:
 
-- колличество данных в outbox сильно растет;
-- autovacuum перегружен;
+- раздуваются индексы и autovacuum на primary;
+- `SELECT FOR UPDATE` по outbox сканирует слишком большой хвост.
 
 ### 8.2. Схема партиционирования
 
-**RANGE по `created_at`**, помесячные партиции:
+Партиционируются **`outbox_events`** и **`notification_history`**: `RANGE` по `created_at`.
+
+При пике 20k RPS **месячные** партиции слишком велики (десятки миллиардов строк при длительном пике). Используем **мелкие** интервалы:
+
+| Параметр | Значение |
+|----------|----------|
+| Гранулярность **по умолчанию** | **1 день** |
+| Автосоздание | **pg_partman** (или cron): создаёт партиции на текущий + следующий интервал |
+| Интервал | **конфигурируемый** (env / Control Plane): `day` \| `hour` — для burst-нагрузки можно уменьшить до часа |
+| Архив | Партиции старше TTL (30–90 дней) → `DETACH` → cold storage или `DROP` |
+| Retry | Воркер читает **текущую и предыдущую** партицию (`scheduled_at` может сместиться на границу суток) |
 
 ```sql
 CREATE TABLE outbox_events (
   ...
 ) PARTITION BY RANGE (created_at);
 
-CREATE TABLE outbox_events_2026_05
+CREATE TABLE outbox_events_2026_05_19
   PARTITION OF outbox_events
-  FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+  FOR VALUES FROM ('2026-05-19') TO ('2026-05-20');
 ```
 
+**Оценка суточной партиции** при 20k RPS в пике 1 час: ≈ 72M строк `send` + retry — управляемо при архиве `done`/`dead` и tuning autovacuum. При непрерывных 20k/s суточная партиция уже на пределе → снижаем интервал до **hour** в конфиге.
 
-Создание партиций -  Cron / pg_partman: партиция на текущий + следующий месяц
-Архив - Партиции старше 30–90 дней → DETACH → cold storage или DROP после TTL
-Retry - `scheduled_at` может попасть в следующий месяц — воркер читает **текущую и предыдущую** партицию
+---
+
+## 9. Rate limiter и Circuit Breaker (на воркере)
+
+Каждый Provider Worker (внутри Notification Service) ограничивает нагрузку на **внешнего провайдера** до вызова API. Параметры — из **Provider Config Service** (кэш 30–60 с). Операционный Redis воркеров **отделён** от Redis Validation.
+
+### 9.1. Rate limiter
+
+| Уровень | Как работает |
+|---------|--------------|
+| **Локальный** | Token bucket на инстансе воркера — быстрый отказ без сети |
+| **Кластерный** | Счётчики в Redis: `INCR` + TTL окна (например 1 с), лимит `rate_limit_rps` per channel из конфига |
+| **Перед вызовом провайдера** | Если лимит исчерпан — провайдер **не вызывается**; outbox: `processing` → `pending`, `scheduled_at = now() + 1s` |
+
+Пример лимитов из конфига: email 2000/s, sms 100/s — задаются администратором per channel.
+
+### 9.2. Circuit breaker
+
+Состояния **per channel** (email и SMS — разные breaker'ы):
+
+| Состояние | Условие | Поведение |
+|-----------|---------|-----------|
+| **closed** | < 50% ошибок за окно 30 с | Обычные вызовы провайдера |
+| **open** | ≥ 50% ошибок (503, timeout) за 30 с | Провайдер **не вызывается**; сразу outbox `retry` с backoff |
+| **half-open** | Через 20 с после open | Пробные вызовы; при успехе → closed, при ошибке → open |
+
+Падение SMS-агрегатора **не открывает** breaker для email.
 
 ---
 
@@ -434,7 +480,7 @@ sequenceDiagram
 
 - **Приём:** `LB → Validation → Notification Service` — валидация, идемпотентность, запись `notifications` + outbox, ответ **202** (P95 ≤ 100 ms).
 - **Маршрутизация:** канал в запросе (`email` / `push` / `sms`); воркер забирает из outbox только свои задачи (`WHERE channel = …`).
-- **Отправка:** Provider Worker → рендер → провайдер; retry — новая строка outbox, результат — `sent` / `failed`.
+- **Отправка:** Provider Worker (часть Notification Service) → rate limit / circuit breaker (§9) → провайдер; retry — новая строка outbox.
 
 ---
 
@@ -449,8 +495,10 @@ sequenceDiagram
 ## 13. Подход к хранению истории уведомлений
 
 - **Модель:** таблица `notification_history` append-only — каждое событие новая строка (`notification_id`, `snapshot` JSONB, `created_at`); старые записи не меняются.
+- **Партиционирование:** `RANGE` по `created_at`, автопартиции через pg_partman — **по умолчанию раз в день**, интервал настраивается (как для outbox, §8.2).
 - **Запись:** снимок пишется в той же транзакции, что и смена статуса (`created`, `processing`, retry, `sent`, `failed`).
-- **Чтение:** по notification_id и timestamp
+- **Чтение:** `GET` по `recipient_id` / `notification_id` — read-replica, отставание 1–2 с.
+- **Доработка:** асинхронная выгрузка `snapshot` в **отдельную БД** / ClickHouse — снять долгосрочный рост с primary; в v1 history остаётся в PostgreSQL с партициями и архивом.
 
 ---
 
@@ -464,11 +512,10 @@ sequenceDiagram
 |--------|-------------------|----------------|
 | Load Balancer | Горизонтально (active/active) | Рост входящего HTTP |
 | Validation Service | 4–8 инстансов за LB | Лёгкая валидация и Redis; разгрузка Notification Service |
-| Notification Service (HTTP) | 4–6 инстансов | Запись в PostgreSQL на приёме |
-| Email / Push / SMS workers | Независимо, по lag outbox на канал | У email и SMS разная нагрузка и лимиты провайдеров |
+| Notification Service (HTTP + workers) | HTTP 4–6 инстансов; воркеры — отдельные deployment внутри NS | Общая БД для транзакционности; каналы масштабируются пулами воркеров |
 | Provider Config Service | 2 инстанса, read-heavy | Конфиг не на критическом пути приёма |
-| PostgreSQL (outbox) | Партиции по `created_at` (помесячно) | Чтобы индекс и vacuum не деградировали на 20k+ строк/с |
-| История | Read-replica для `GET` | Запись на primary, чтение не мешает приёму |
+| PostgreSQL (outbox, history) | Автопартиции по `created_at`, **по умолчанию 1 день** | Конфигурируемый интервал (day/hour); архив старых партиций |
+| История | Read-replica для `GET` | Запись на primary; доработка — async в отдельную БД |
 
 Все сервисы приёма и воркеры **stateless**: состояние — в PostgreSQL, Redis и Provider Config Service. Sticky sessions на LB **не нужны**. Воркеры конкурируют за outbox через `SELECT … FOR UPDATE SKIP LOCKED` — добавление инстанса увеличивает пропускную способность канала без координации между ними.
 
@@ -496,7 +543,9 @@ sequenceDiagram
 | **Outbox в PostgreSQL** | Транзакционность с `notifications` — нет dual-write; проще эксплуатация (одна СУБД) | Высокая нагрузка на PostgreSQL; обязательны партиции outbox и tuning vacuum                   |
 | **`SELECT FOR UPDATE SKIP LOCKED`** на outbox | Нет дублей задач между воркерами; не нужен отдельный брокер | дополнительно нагружает autovacuum                                                            |
 | **Отдельный Validation Service + Redis** | Приём и идемпотентность масштабируются отдельно от доставки | новая точка падения                                                                           |
-| **History append-only + JSONB snapshot** | Полный audit trail; гибкая схема событий в `snapshot` | Рост таблицы history; для аналитики на годах — архив или выгрузка                             |
+| **History append-only + JSONB snapshot** | Полный audit trail; партиции по дню | Рост на primary; **доработка:** async в отдельную БД / ClickHouse |
+| **Workers внутри Notification Service** | Одна БД, транзакционный outbox | Меньше независимого масштабирования канала, чем у «микросервис на канал» |
+| **Партиции outbox/history по дню** | Умеренный размер партиции при типичном пике | При 20k/s 24/7 нужен интервал `hour` или шардирование |
 | **Provider Config Service отдельно** | Смена лимитов и endpoint без рестарта воркеров | Задержка применения до TTL кэша (30–60 с); ещё один сервис в эксплуатации                     |
 | **Асинхронная доставка** | P95 приёма ≤ 100 ms при 20k RPS | Клиент не узнаёт об успехе/ошибке провайдера в том же HTTP-ответе — только по статусу/history |
 
