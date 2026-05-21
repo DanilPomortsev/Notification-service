@@ -12,7 +12,7 @@
 - внешние провайдеры с лимитами и периодической недоступностью;
 - запрет на «случайные» дубли при повторных запросах клиента и при at-least-once доставке внутри платформы.
 
-Решение разделено на **Control Plane** (шаблоны, **Provider Config Service** — конфигурации провайдеров в отдельной БД) и **Data Plane** (балансировщик → сервис валидации → **Notification Service** с воркерами доставки, outbox, история). Таблицы `outbox_events` и `notification_history` — **партиционированы** по времени (§8, §7.3).
+Решение разделено на **Control Plane** (шаблоны, **Provider Config Service**) и **Data Plane** (балансировщик → Validation → **Notification Service** → микросервисы **Email / Push / SMS Worker**, общая PostgreSQL, outbox, история). Таблицы `outbox_events` и `notification_history` — **партиционированы** по времени (§8, §7.3).
 
 ---
 
@@ -37,7 +37,7 @@
 | Сценарий | Описание |
 |----------|----------|
 | **Приём и постановка в очередь** | Validation → Notification Service: одна транзакция `notifications` + `outbox` + запись в `notification_history`; ответ **202** без вызова провайдера |
-| **Асинхронная доставка** | Provider Worker забирает задачу из outbox (`SELECT … FOR UPDATE SKIP LOCKED`), рендерит шаблон, вызывает провайдера |
+| **Асинхронная доставка** | Микросервис Provider Worker забирает задачу из outbox (`SELECT … FOR UPDATE SKIP LOCKED`), рендерит шаблон, вызывает провайдера |
 | **Успешная отправка** | Провайдер вернул OK → `status = sent`, outbox `done`, снимок в history |
 | **Retry при сбое провайдера** | Временная ошибка (503, timeout) → новая строка outbox `retry` с `scheduled_at`; до `max_attempts` |
 | **Финальный отказ** | Fatal-ошибка или исчерпан лимит попыток → `status = failed`, outbox `dead` |
@@ -56,7 +56,7 @@
 | Шаблон | Текстовая заготовка с плейсхолдерами; компилируется при старте воркера.                             |
 | Провайдер | Внешний API доставки (SMTP-шлюз, FCM/APNs, SMS-агрегатор).                                          |
 | Idempotency key | Ключ, который клиент передаёт для защиты от повторного создания при ретрае HTTP.                    |
-| Worker | Сущность ответственная за рендер и отправку сообщения в соответствующий провайдер                   |
+| Provider Worker | Микросервис доставки по одному каналу (email / push / sms): рендер шаблона и вызов провайдера        |
 | Retry | Повторная попытка отправки после временной ошибки провайдера.                                       |
 | Rate limiting | Ограничение скорости вызовов провайдера и/или приёма по клиенту.                                    |
 | Deduplication | Гарантия, что одно логическое уведомление не уйдёт пользователю дважды.                             |
@@ -89,14 +89,14 @@
 | Latency приёма | P95 ≤ 100 мс | Провайдер не вызывается в HTTP; одна транзакция «уведомление + outbox» |
 | Надёжность | не терять принятые уведомления | Outbox в той же транзакции, что и `notifications`; воркеры `FOR UPDATE SKIP LOCKED` |
 | Консистентность | надёжный факт приёма; история — eventual | Primary для записи; `notification_history` append-only; чтение с replica |
-| Масштабирование | отдельно: приём, валидация; воркеры — в составе Notification Service | Validation масштабируется отдельно; email/push/sms — отдельные пулы процессов внутри NS |
+| Масштабирование | отдельно: приём, валидация, микросервисы воркеров по каналам | Email / Push / SMS Worker — независимые deployment и масштаб |
 | Ограничения | rate limit, изоляция каналов | Rate limiter + circuit breaker на воркер каждого провайдера |
 
 ---
 
 ## 6. Архитектура решения (общая схема)
 
-Платформа построена вокруг **outbox в PostgreSQL**: приём фиксирует уведомление и задачу на доставку в одной транзакции; воркеры провайдеров забирают задачи через `SELECT … FOR UPDATE SKIP LOCKED`. **Kafka не используется** — очередь доставки и retry — строки в партиционированной таблице `outbox_events`.
+Платформа построена вокруг **outbox в PostgreSQL**: Notification Service фиксирует уведомление и задачу в одной транзакции; **микросервисы** Email / Push / SMS Worker забирают задачи через `SELECT … FOR UPDATE SKIP LOCKED`. **Kafka не используется** — очередь доставки и retry — строки в партиционированной таблице `outbox_events`.
 
 ### 6.1. Семь шагов потока (видение решения)
 
@@ -107,15 +107,18 @@ flowchart LR
     VAL --> REDIS[(Redis Validation)]
     VAL --> NS[Notification Service]
     NS --> PG[(PostgreSQL Data)]
-    NS --> W_EMAIL[Email Worker]
-    NS --> W_PUSH[Push Worker]
-    NS --> W_SMS[SMS Worker]
+    W_EMAIL[Email Worker Service]
+    W_PUSH[Push Worker Service]
+    W_SMS[SMS Worker Service]
+    W_EMAIL & W_PUSH & W_SMS --> PG
     W_EMAIL & W_PUSH & W_SMS --> PCS[Provider Config Service]
     PCS --> PG_CFG[(PostgreSQL Config)]
     W_EMAIL --> P1[SMTP]
     W_PUSH --> P2[FCM/APNs]
     W_SMS --> P3[SMS API]
-    W_EMAIL & W_PUSH & W_SMS --> PG
+    NS -. async .-> HS[History Service]
+    HS --> PG_HIST[(PostgreSQL History)]
+
 ```
 
 ---
@@ -150,16 +153,17 @@ flowchart LR
 
 > Ответ клиенту после создания: **202** с `notification_id`, `status`, `created_at`. Доставку выполняют **Provider Workers** (§7.4).
 
-### 7.4. Provider Workers (часть Notification Service)
+### 7.4. Provider Workers (микросервисы)
 
-Provider Workers — **не отдельные микросервисы**, а **пулы процессов / deployment внутри Notification Service** (отдельный пул на канал: email, push, sms). Каждый пул обслуживает только своего провайдера и пишет в **ту же PostgreSQL**, что и HTTP-часть приёма.
+Три **микросервиса** доставки — **Email Worker Service**, **Push Worker Service**, **SMS Worker Service**. Каждый обслуживает только свой канал и своего провайдера. Notification Service **не отправляет** уведомления — только создаёт записи в БД и outbox.
 
 | | |
 |---|---|
-| **Плюс общей БД** | Транзакционный outbox: `notifications` + `outbox_events` + `notification_history` в одной транзакции при приёме и при смене статуса — без dual-write и отдельного брокера |
-| **Минус** | Меньше гибкости масштабирования «канал = свой микросервис со своей БД»; при проблемах с primary PostgreSQL затронуты все каналы (компенсация: Patroni, изоляция каналов на уровне воркеров и circuit breaker) |
+| **Плюс** | Независимое масштабирование и деплой по каналу; сбой/релиз SMS не трогает email |
+| **Общая PostgreSQL** | Все микросервисы и Notification Service используют **одну Data Plane БД** — иначе нельзя атомарно принять уведомление и поставить задачу в outbox; воркеры обновляют статус в той же БД |
+| **Риск** | Проблемы с primary PostgreSQL затрагивают все каналы (компенсация: Patroni, изоляция на уровне приложения) |
 
-Масштабирование канала — **горизонтальное добавление инстансов** пула воркеров; конкуренция за задачи через `SKIP LOCKED`.
+Масштабирование — **горизонтально инстансы** нужного Worker Service; конкуренция за outbox через `SKIP LOCKED` по `channel`.
 
 | Задача | Что делает |
 |--------|------------|
@@ -269,7 +273,7 @@ CREATE TABLE outbox_events_2026_05_19
 
 ## 9. Rate limiter и Circuit Breaker (на воркере)
 
-Каждый Provider Worker (внутри Notification Service) ограничивает нагрузку на **внешнего провайдера** до вызова API. Параметры — из **Provider Config Service** (кэш 30–60 с). Операционный Redis воркеров **отделён** от Redis Validation.
+Каждый микросервис Provider Worker ограничивает нагрузку на **внешнего провайдера** до вызова API. Параметры — из **Provider Config Service** (кэш 30–60 с). Операционный Redis воркеров **отделён** от Redis Validation.
 
 ### 9.1. Rate limiter
 
@@ -480,7 +484,7 @@ sequenceDiagram
 
 - **Приём:** `LB → Validation → Notification Service` — валидация, идемпотентность, запись `notifications` + outbox, ответ **202** (P95 ≤ 100 ms).
 - **Маршрутизация:** канал в запросе (`email` / `push` / `sms`); воркер забирает из outbox только свои задачи (`WHERE channel = …`).
-- **Отправка:** Provider Worker (часть Notification Service) → rate limit / circuit breaker (§9) → провайдер; retry — новая строка outbox.
+- **Отправка:** микросервис Provider Worker → rate limit / circuit breaker (§9) → провайдер; retry — новая строка outbox.
 
 ---
 
@@ -512,7 +516,8 @@ sequenceDiagram
 |--------|-------------------|----------------|
 | Load Balancer | Горизонтально (active/active) | Рост входящего HTTP |
 | Validation Service | 4–8 инстансов за LB | Лёгкая валидация и Redis; разгрузка Notification Service |
-| Notification Service (HTTP + workers) | HTTP 4–6 инстансов; воркеры — отдельные deployment внутри NS | Общая БД для транзакционности; каналы масштабируются пулами воркеров |
+| Notification Service | 4–6 инстансов (только приём и API) | Запись `notifications` + outbox + history |
+| Email / Push / SMS Worker Service | Независимо, по lag outbox на канал | Отдельный микросервис на канал; общая PostgreSQL Data Plane |
 | Provider Config Service | 2 инстанса, read-heavy | Конфиг не на критическом пути приёма |
 | PostgreSQL (outbox, history) | Автопартиции по `created_at`, **по умолчанию 1 день** | Конфигурируемый интервал (day/hour); архив старых партиций |
 | История | Read-replica для `GET` | Запись на primary; доработка — async в отдельную БД |
@@ -526,7 +531,7 @@ sequenceDiagram
 | Падение инстанса Validation / Notification | LB исключает инстанс по health check; трафик на оставшиеся |
 | Redis Validation недоступен | Fallback на `UNIQUE(client_id, idempotency_key)` в PostgreSQL — выше latency, дубли не создаются |
 | Notification Service недоступен после Validation | Клиент получает **502**; повтор с тем же `Idempotency-Key` не создаёт второе уведомление |
-| Падение Provider Worker | Строки outbox остаются `pending`; другие воркеры того же канала подхватывают задачи |
+| Падение инстанса Worker Service | Строки outbox остаются `pending`; другие инстансы того же микросервиса подхватывают задачи |
 | Provider Config Service недоступен | Воркер работает на последнем кэше; без кэша — откладывает задачу (`scheduled_at`) |
 | Временная недоступность провайдера (503) | Retry через новые строки outbox; circuit breaker снижает «шторм» запросов |
 | Падение PostgreSQL primary | Patroni failover; `notifications` и outbox на primary — после переключения воркеры продолжают с `pending` |
@@ -544,7 +549,7 @@ sequenceDiagram
 | **`SELECT FOR UPDATE SKIP LOCKED`** на outbox | Нет дублей задач между воркерами; не нужен отдельный брокер | дополнительно нагружает autovacuum                                                            |
 | **Отдельный Validation Service + Redis** | Приём и идемпотентность масштабируются отдельно от доставки | новая точка падения                                                                           |
 | **History append-only + JSONB snapshot** | Полный audit trail; партиции по дню | Рост на primary; **доработка:** async в отдельную БД / ClickHouse |
-| **Workers внутри Notification Service** | Одна БД, транзакционный outbox | Меньше независимого масштабирования канала, чем у «микросервис на канал» |
+| **Микросервисы Worker + общая PostgreSQL** | Масштабирование каналов отдельно; транзакционный outbox с Notification Service | Несколько сервисов на одну БД — общая точка отказа при падении primary |
 | **Партиции outbox/history по дню** | Умеренный размер партиции при типичном пике | При 20k/s 24/7 нужен интервал `hour` или шардирование |
 | **Provider Config Service отдельно** | Смена лимитов и endpoint без рестарта воркеров | Задержка применения до TTL кэша (30–60 с); ещё один сервис в эксплуатации                     |
 | **Асинхронная доставка** | P95 приёма ≤ 100 ms при 20k RPS | Клиент не узнаёт об успехе/ошибке провайдера в том же HTTP-ответе — только по статусу/history |
